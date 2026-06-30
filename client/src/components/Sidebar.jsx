@@ -80,7 +80,7 @@ const Sidebar = ({ isMenuOpen, setIsMenuOpen }) => {
         <img src={assets.diamond_icon} className='w-4.5 dark:invert' alt="" />
         <div className='flex flex-col text-sm'>
             <p>Credits : {user?.credits}</p>
-            <p className='text-xs text-gray-400'>Purchase credits to use quickgpt</p>
+            <p className='text-xs text-gray-400'>Purchase credits to use SwiftAI</p>
         </div>
     </div>
 
