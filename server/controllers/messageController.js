@@ -43,59 +43,144 @@ export const textMessageController = async (req, res) => {
 }
 
 // Image Generation Message Controller
+
 export const imageMessageController = async (req, res) => {
     try {
         const userId = req.user._id;
-        // Check credits
-        if(req.user.credits < 2){
-            return res.json({success: false, message: "You don't have enough credits to use this feature"})
+        const { prompt, chatId, isPublished } = req.body;
+
+        if (!prompt || !prompt.trim()) {
+            return res.status(400).json({
+                success: false,
+                message: "Please enter an image prompt."
+            });
         }
-        const {prompt, chatId, isPublished} = req.body
-        // Find chat
-        const chat = await Chat.findOne({userId, _id: chatId})
 
-         // Push user message
-         chat.messages.push({
-            role: "user", 
-            content: prompt, 
-            timestamp: Date.now(), 
-            isImage: false});
+        if (req.user.credits < 2) {
+            return res.status(400).json({
+                success: false,
+                message: "You don't have enough credits to generate an image."
+            });
+        }
 
-        // Encode the prompt
-        const encodedPrompt = encodeURIComponent(prompt)
+        const chat = await Chat.findOne({
+            userId,
+            _id: chatId
+        });
 
-        // Construct ImageKit AI generation URL
-        const generatedImageUrl = `${process.env.IMAGEKIT_URL_ENDPOINT}/ik-genimg-prompt-${encodedPrompt}/quickgpt/${Date.now()}.png?tr=w-800,h-800`;
+        if (!chat) {
+            return res.status(404).json({
+                success: false,
+                message: "Chat not found."
+            });
+        }
 
-        // Trigger generation by fetching from ImageKit
-        const aiImageResponse = await axios.get(generatedImageUrl, {responseType: "arraybuffer"})
+        const endpoint = process.env.IMAGEKIT_URL_ENDPOINT?.replace(/\/+$/, "");
 
-        // Convert to Base64
-        const base64Image = `data:image/png;base64,${Buffer.from(aiImageResponse.data,"binary").toString('base64')}`;
+        if (!endpoint) {
+            throw new Error("IMAGEKIT_URL_ENDPOINT is missing in environment variables.");
+        }
 
-        // Upload to ImageKit Media Library
-        const uploadResponse = await imagekit.upload({
-            file: base64Image,
-            fileName: `${Date.now()}.png`,
-            folder: "quickgpt"
-        })
+        // Use a unique filename for every generation request.
+        const fileName = `image-${Date.now()}.png`;
+        const encodedPrompt = encodeURIComponent(prompt.trim());
 
+        const generatedUrl =
+            `${endpoint}/ik-genimg-prompt-${encodedPrompt}/quickgpt/${fileName}`;
+
+        let imageReady = false;
+        let lastError = "ImageKit has not returned an image yet.";
+
+        // ImageKit may return a temporary HTML response while generating.
+        // Retry briefly; do not save a broken image URL.
+        for (let attempt = 1; attempt <= 4; attempt++) {
+            try {
+                const response = await axios.get(generatedUrl, {
+                    responseType: "arraybuffer",
+                    timeout: 2500,
+                    validateStatus: () => true
+                });
+
+                const contentType =
+                    response.headers["content-type"] || "";
+
+                const intermediate =
+                    String(
+                        response.headers["is-intermediate-response"] || ""
+                    ).toLowerCase() === "true";
+
+                if (
+                    response.status >= 200 &&
+                    response.status < 300 &&
+                    contentType.toLowerCase().startsWith("image/") &&
+                    !intermediate
+                ) {
+                    imageReady = true;
+                    break;
+                }
+
+                const responseText = Buffer
+                    .from(response.data || [])
+                    .toString("utf8")
+                    .slice(0, 300);
+
+                lastError = intermediate
+                    ? "ImageKit is still preparing the image."
+                    : `ImageKit returned HTTP ${response.status}, content-type: ${contentType}. ${responseText}`;
+            } catch (error) {
+                lastError = error.message;
+            }
+
+            if (attempt < 4) {
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+        }
+
+        if (!imageReady) {
+            console.error("ImageKit generation failed:", lastError);
+
+            return res.status(502).json({
+                success: false,
+                message: "Image is not ready yet. Please wait a few minutes and try again.",
+                error: lastError
+            });
+        }
+
+        // Save only after ImageKit returns actual image data.
         const reply = {
-                role: 'assistant',
-                content: uploadResponse.url,
-                timestamp: Date.now(), 
-                isImage: true,
-                isPublished
-        }
+            role: "assistant",
+            content: generatedUrl,
+            timestamp: Date.now(),
+            isImage: true,
+            isPublished: Boolean(isPublished)
+        };
 
-         res.json({success: true, reply})
+        chat.messages.push({
+            role: "user",
+            content: prompt.trim(),
+            timestamp: Date.now(),
+            isImage: false
+        });
 
-         chat.messages.push(reply)
-         await chat.save()
+        chat.messages.push(reply);
+        await chat.save();
 
-          await User.updateOne({_id: userId}, {$inc: {credits: -2}})
+        await User.updateOne(
+            { _id: userId },
+            { $inc: { credits: -2 } }
+        );
+
+        return res.json({
+            success: true,
+            reply
+        });
 
     } catch (error) {
-        res.json({ success: false, message: error.message });
+        console.error("Image generation error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: error.message || "Image generation failed."
+        });
     }
-}
+};
